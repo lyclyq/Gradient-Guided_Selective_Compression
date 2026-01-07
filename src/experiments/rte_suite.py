@@ -1,6 +1,7 @@
 import os, json, logging
 from datetime import datetime
 from copy import deepcopy
+from tqdm import tqdm
 from src.utils.seed import set_seed
 from src.utils.io import build_output_paths, ensure_dir
 from src.data.glue_rte import get_loaders
@@ -22,6 +23,14 @@ def run_suite(model_name:str, seeds, run_tag:str, config_path:str):
     with open(config_path,"r") as f:
         base_cfg=json.load(f)
     task="rte"
+    runs_per_exp = len(base_cfg.get("lr_list", [])) + 1
+    total_runs = len(seeds) * len([
+        ("ab_only", dict(router_mode=False, alt_mode="ab_only", use_alt=False)),
+        ("offline_project", dict(router_mode=False, alt_mode="alt_only", use_alt=True)),
+        ("online_nodistill", dict(router_mode=False, alt_mode="none", use_alt=True)),
+        ("ours_soft_absorb", dict(router_mode=True, alt_mode="none", use_alt=True)),
+    ]) * runs_per_exp
+    total_pbar = tqdm(total=total_runs, desc="total runs", leave=True)
     for seed in seeds:
         cfg0=deepcopy(base_cfg)
         cfg0["seed"]=seed
@@ -67,7 +76,7 @@ def run_suite(model_name:str, seeds, run_tag:str, config_path:str):
                 return m
 
             hpo_csv=os.path.join(paths["hpo"], "lr_sweep.csv")
-            best_lr = lr_sweep(cfg, model_builder, loaders, device, exp, hpo_csv)
+            best_lr = lr_sweep(cfg, model_builder, loaders, device, exp, hpo_csv, logger=logger, progress_bar=total_pbar)
             logger.info("Best lr selected: %s", best_lr)
 
             # Train final
@@ -81,6 +90,7 @@ def run_suite(model_name:str, seeds, run_tag:str, config_path:str):
                                           router_mode=cfg_f.get("router_mode",False),
                                           alt_mode=cfg_f.get("alt_mode","none"),
                                           logger=logger)
+            total_pbar.update(1)
             logger.info(
                 "Experiment end: %s val_acc=%.4f test_acc=%.4f end_time=%s",
                 exp,
@@ -118,3 +128,4 @@ def run_suite(model_name:str, seeds, run_tag:str, config_path:str):
         ensure_dir(plot_path)
         out_png=os.path.join(plot_path, f"compare_seed{seed}_{run_tag}.png")
         plot_compare(curves, out_png, title=f"{model_name} {task} seed {seed}")
+    total_pbar.close()
