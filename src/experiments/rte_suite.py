@@ -19,17 +19,23 @@ def _device_from_cfg(cfg):
         return "cpu"
     return dev
 
-def run_suite(model_name:str, seeds, run_tag:str, config_path:str):
+def run_suite(model_name:str, seeds, run_tag:str, config_path:str, exp_filter=None):
     with open(config_path,"r") as f:
         base_cfg=json.load(f)
     task="rte"
     runs_per_exp = len(base_cfg.get("lr_list", [])) + 1
-    total_runs = len(seeds) * len([
+    exp_filter = exp_filter or []
+    exps = [
         ("ab_only", dict(router_mode=False, alt_mode="ab_only", use_alt=False)),
         ("offline_project", dict(router_mode=False, alt_mode="alt_only", use_alt=True)),
         ("online_nodistill", dict(router_mode=False, alt_mode="none", use_alt=True)),
         ("ours_soft_absorb", dict(router_mode=True, alt_mode="none", use_alt=True)),
-    ]) * runs_per_exp
+    ]
+    if exp_filter:
+        exps = [pair for pair in exps if pair[0] in exp_filter]
+        if not exps:
+            raise ValueError(f"No experiments match exp_filter={exp_filter}")
+    total_runs = len(seeds) * len(exps) * runs_per_exp
     total_pbar = tqdm(total=total_runs, desc="total runs", leave=True)
     for seed in seeds:
         cfg0=deepcopy(base_cfg)
@@ -38,13 +44,6 @@ def run_suite(model_name:str, seeds, run_tag:str, config_path:str):
         train_loader, val_loader, test_loader = get_loaders(model_name, cfg0["batch_size"], cfg0["max_length"], seed)
         loaders=(train_loader, val_loader, test_loader)
         device=_device_from_cfg(cfg0)
-
-        exps = [
-            ("ab_only", dict(router_mode=False, alt_mode="ab_only", use_alt=False)),
-            ("offline_project", dict(router_mode=False, alt_mode="alt_only", use_alt=True)),
-            ("online_nodistill", dict(router_mode=False, alt_mode="none", use_alt=True)),
-            ("ours_soft_absorb", dict(router_mode=True, alt_mode="none", use_alt=True)),
-        ]
 
         curves=[]
         for exp, meta in exps:

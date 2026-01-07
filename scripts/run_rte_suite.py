@@ -7,9 +7,17 @@ def main():
     ap.add_argument("--seeds", type=str, default="2")
     ap.add_argument("--run_tag", type=str, default="s1")
     ap.add_argument("--config", type=str, default="configs/rte_default.json")
+    ap.add_argument("--exp", type=str, default="", help="Comma-separated experiment names to run.")
     args = ap.parse_args()
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
-    run_suite(model_name=args.model_name, seeds=seeds, run_tag=args.run_tag, config_path=args.config)
+    exp_filter = [e.strip() for e in args.exp.split(",") if e.strip()]
+    run_suite(
+        model_name=args.model_name,
+        seeds=seeds,
+        run_tag=args.run_tag,
+        config_path=args.config,
+        exp_filter=exp_filter,
+    )
 
 if __name__ == "__main__":
     main()
