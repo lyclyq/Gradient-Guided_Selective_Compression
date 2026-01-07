@@ -118,7 +118,7 @@ def train_one(
 
     for ep in range(int(cfg["epochs"])):
         model.train()
-        pbar = tqdm(train_loader, desc=f"{exp_name} ep{ep+1}", leave=False)
+        pbar = tqdm(train_loader, desc=f"{exp_name} ep{ep+1}", leave=True)
 
         for batch in pbar:
             step += 1
