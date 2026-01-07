@@ -10,4 +10,5 @@ def build_output_paths(root, model_name, task, exp, run_tag):
         "hpo": os.path.join(base, "hpo"),
         "final": os.path.join(base, "final"),
         "plots": os.path.join(base, "plots"),
+        "log": os.path.join(base, "log"),
     }

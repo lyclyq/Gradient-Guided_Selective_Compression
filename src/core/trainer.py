@@ -88,6 +88,7 @@ def train_one(
     out_csv_path: str,
     router_mode: bool = False,
     alt_mode: str = "none",
+    logger=None,
 ):
     """
     alt_mode: none|ab_only|alt_only|offline_project
@@ -316,6 +317,15 @@ def train_one(
                     }
                 )
                 pbar.set_postfix({"val": f"{val_acc:.3f}", "test": f"{test_acc:.3f}"})
+                if logger is not None:
+                    logger.info(
+                        "Step %s (epoch %s) loss=%.6f val_acc=%.4f test_acc=%.4f",
+                        step,
+                        ep + 1,
+                        float(loss.item()),
+                        val_acc,
+                        test_acc,
+                    )
 
     df = pd.DataFrame(rows)
     df.to_csv(out_csv_path, index=False)
@@ -323,4 +333,6 @@ def train_one(
     # final eval
     val_acc = evaluate(model, val_loader, device)
     test_acc = evaluate(model, test_loader, device)
+    if logger is not None:
+        logger.info("Final val_acc=%.4f test_acc=%.4f", val_acc, test_acc)
     return val_acc, test_acc
