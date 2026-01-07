@@ -1,4 +1,5 @@
-import os, json
+import os, json, logging
+from datetime import datetime
 from copy import deepcopy
 from src.utils.seed import set_seed
 from src.utils.io import build_output_paths, ensure_dir
@@ -39,11 +40,27 @@ def run_suite(model_name:str, seeds, run_tag:str, config_path:str):
         curves=[]
         for exp, meta in exps:
             paths = build_output_paths(OUTPUT_ROOT, model_name, task, exp, run_tag)
-            for k in ("hpo","final","plots"):
+            for k in ("hpo","final","plots","log"):
                 ensure_dir(paths[k])
+            log_name = f"{exp}_seed{seed}_{run_tag}.log"
+            log_path = os.path.join(paths["log"], log_name)
+            logger = logging.getLogger(__name__)
+            logger.setLevel(logging.INFO)
+            for handler in list(logger.handlers):
+                if isinstance(handler, logging.FileHandler):
+                    logger.removeHandler(handler)
+                    handler.close()
+            file_handler = logging.FileHandler(log_path)
+            formatter = logging.Formatter(
+                "%(asctime)s - %(levelname)s - %(message)s"
+            )
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
             # HPO
             cfg=deepcopy(cfg0)
             cfg.update(meta)
+            logger.info("Experiment start: %s seed=%s run_tag=%s", exp, seed, run_tag)
+            logger.info("Config: %s", json.dumps(cfg, sort_keys=True))
             def model_builder():
                 m = build_model(model_name, num_labels=2)
                 m = inject_adapters(m, r=cfg["r"], r_alt=cfg["r_alt"], use_alt=meta["use_alt"], ab_only=(exp=="ab_only"))
@@ -51,6 +68,7 @@ def run_suite(model_name:str, seeds, run_tag:str, config_path:str):
 
             hpo_csv=os.path.join(paths["hpo"], "lr_sweep.csv")
             best_lr = lr_sweep(cfg, model_builder, loaders, device, exp, hpo_csv)
+            logger.info("Best lr selected: %s", best_lr)
 
             # Train final
             cfg_f=deepcopy(cfg)
@@ -61,7 +79,17 @@ def run_suite(model_name:str, seeds, run_tag:str, config_path:str):
             val_acc, test_acc = train_one(cfg_f, model, train_loader, val_loader, test_loader,
                                           device=device, exp_name=exp, out_csv_path=curve_csv,
                                           router_mode=cfg_f.get("router_mode",False),
-                                          alt_mode=cfg_f.get("alt_mode","none"))
+                                          alt_mode=cfg_f.get("alt_mode","none"),
+                                          logger=logger)
+            logger.info(
+                "Experiment end: %s val_acc=%.4f test_acc=%.4f end_time=%s",
+                exp,
+                val_acc,
+                test_acc,
+                datetime.now().isoformat(timespec="seconds"),
+            )
+            logger.removeHandler(file_handler)
+            file_handler.close()
 
             # Offline projection step for offline_project baseline:
             if exp == "offline_project":
