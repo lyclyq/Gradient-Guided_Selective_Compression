@@ -189,9 +189,9 @@ def train_one(
                             VZ = a.V.detach() @ Z
                             UZ = a.U.detach() @ Z
                             VZ_pinv = torch.linalg.pinv(VZ, rcond=1e-6)
-                            UZt_pinv = torch.linalg.pinv(UZ.t(), rcond=1e-6)
+                            UZ_pinv = torch.linalg.pinv(UZ, rcond=1e-6)
                             G1 = a.U.grad @ VZ_pinv
-                            G2 = UZt_pinv @ a.V.grad.t()
+                            G2 = (a.V.grad @ UZ_pinv).t()
                             G_alt = 0.5 * (G1 + G2)
                             G_total = G_alt if G_total is None else (G_total + G_alt)
 
