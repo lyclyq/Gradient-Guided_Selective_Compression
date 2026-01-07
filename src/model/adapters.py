@@ -42,9 +42,10 @@ class AdapterLinear(nn.Module):
             self.U = nn.Parameter(torch.empty(self.out_features, self.r_alt))
             self.V = nn.Parameter(torch.empty(self.in_features, self.r_alt))
             # Z as diagonal vector -> effective rank r_alt but compact; stable
-            self.z = nn.Parameter(torch.zeros(self.r_alt))
+            self.z = nn.Parameter(torch.empty(self.r_alt))
             nn.init.kaiming_uniform_(self.U, a=math.sqrt(5))
             nn.init.kaiming_uniform_(self.V, a=math.sqrt(5))
+            nn.init.normal_(self.z, mean=0.0, std=1e-3)
         else:
             self.register_parameter("U", None)
             self.register_parameter("V", None)
@@ -98,7 +99,8 @@ class AdapterLinear(nn.Module):
         # dU = G @ V diag(z)
         # dV = G^T @ U diag(z)
         # dz = diag(U^T G V)
-        Z = torch.diag(self.z)
+        eps = 1e-6
+        Z = torch.diag(self.z.clamp_min(eps))
         dU = G @ (self.V @ Z)
         dV = G.t() @ (self.U @ Z)
         dz_full = self.U.t() @ G @ self.V  # r_alt x r_alt

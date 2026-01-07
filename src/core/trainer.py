@@ -184,13 +184,14 @@ def train_one(
 
                         # alt gradient estimate
                         if a.use_alt and (a.U.grad is not None) and (a.V.grad is not None) and (a.z.grad is not None):
-                            Z = torch.diag(a.z.detach())
+                            eps = 1e-6
+                            Z = torch.diag(a.z.detach().clamp_min(eps))
                             VZ = a.V.detach() @ Z
                             UZ = a.U.detach() @ Z
-                            VZt_pinv = torch.linalg.pinv(VZ.t())
-                            UZt_pinv = torch.linalg.pinv(UZ.t())
-                            G1 = a.U.grad @ VZt_pinv
-                            G2 = (UZt_pinv @ a.V.grad.t()).t()
+                            VZ_pinv = torch.linalg.pinv(VZ, rcond=1e-6)
+                            UZt_pinv = torch.linalg.pinv(UZ.t(), rcond=1e-6)
+                            G1 = a.U.grad @ VZ_pinv
+                            G2 = UZt_pinv @ a.V.grad.t()
                             G_alt = 0.5 * (G1 + G2)
                             G_total = G_alt if G_total is None else (G_total + G_alt)
 
