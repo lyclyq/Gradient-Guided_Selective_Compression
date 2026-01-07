@@ -1,0 +1,29 @@
+{
+  "task": "rte",
+  "batch_size": 16,
+  "max_length": 256,
+  "seed": 2,
+  "epochs_hpo": 4,
+  "epochs_train": 10,
+  "lr_list": [
+    7e-05,
+    5e-05,
+    3e-05,
+    2e-05
+  ],
+  "weight_decay": 0.0,
+  "r": 8,
+  "r_alt": 32,
+  "vote_chunks": 4,
+  "absorb_every_steps": 200,
+  "rho_alt": 0.99,
+  "beta_suppress": 0.7,
+  "tau_ab": 0.7,
+  "tau_s": 0.5,
+  "tau_delta": 0.12,
+  "tau_cap": 0.7,
+  "k_sigmoid": 10.0,
+  "k_cap": 10.0,
+  "absorb_alpha": 0.7,
+  "device": "cuda"
+}
