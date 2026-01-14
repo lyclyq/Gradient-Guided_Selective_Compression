@@ -1,0 +1,22 @@
+# configs/schedules/final.yaml
+stage: final
+
+train:
+  epochs: 10
+  warmup_ratio: 0.06
+  eval:
+    strategy: per_epoch
+
+hpo:
+  mode: hierarchical
+
+  lr_grid:
+    min_exp: -6
+    max_exp: -3
+    points: 15
+
+  warmup_grid: [0.06]
+
+seeds:
+  preeval: [12, 24, 36]
+  final: [2, 3, 5, 7, 11]

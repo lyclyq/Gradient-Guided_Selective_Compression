@@ -1,0 +1,105 @@
+# configs/base.yaml
+stage: debug
+
+task:
+  name: glue/rte
+  max_len: 128
+
+model:
+  name: roberta-base
+  type: sequence_classification
+
+method:
+  name: baseline
+  lora:
+    r: 8
+    R: 32
+    alpha: 16
+    dropout: 0.1
+  ours:
+    votes: 8
+    ema_H: 4
+    percentile_p: 90
+    k: 8.0
+    gamma_r: 0.3
+    gamma_hi: 0.3
+    eta: 0.2
+    beta_max: 0.5
+    rho_max: 0.5
+    alpha_min: 0.1
+    lambda_n: 0.4
+    lambda_o: 0.4
+
+train:
+  epochs: 3
+  batch_size: 32
+  lr: 2e-5
+  warmup_ratio: 0.06         # 固定，不参与搜索
+  weight_decay: 0.01
+  grad_accum: 1
+  max_grad_norm: 1.0
+  seed: 42
+  eval:
+    strategy: dense_early
+    dense_early_epochs: 2
+    dense_early_per_epoch: 8
+
+compute:
+  accelerator: cuda
+  num_gpus: 1
+  gpus_per_trial: 1
+  mixed_precision: bf16
+  compile: false
+
+hpo:
+  mode: hierarchical
+
+  lr_grid:
+    min_exp: -6
+    max_exp: -3
+    points: 15
+
+  # warmup fixed (single value) — keep for backward compat, but do NOT expand trials
+  warmup_grid: [0.06]
+
+  baseline_lr_points: 5
+
+  # staged ours search defaults
+  ours:
+    lr_neighbor_points_small: 7
+    lr_neighbor_points_large: 5
+    stages:
+      s1:
+        epochs: 1
+        seeds: 1
+        trials: 100
+        param_pool: ["lambda_n", "lambda_o", "eta", "k", "gamma_hi"]
+        candidates_per_param: 4
+        keep_top: 2
+      s2:
+        epochs: 2
+        seeds: 1
+        trials: 40
+        combine_topk_params: 3
+      s3:
+        epochs: 4
+        seeds_small: 2
+        seeds_large: 1
+        trials_small: 120
+        trials_large: 90
+        score:
+          w_max: 0.5
+          w_final: 0.4
+          w_avg: 0.1
+
+io:
+  root: runs
+  overwrite: ask
+  save_best_hparams_json: true
+
+log:
+  csv: true
+  swanlab:
+    enabled: false
+    project: "ShakeAlign_LoRA"
+    run_group: null

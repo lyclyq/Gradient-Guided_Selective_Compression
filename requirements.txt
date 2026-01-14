@@ -1,0 +1,9 @@
+torch
+transformers
+datasets
+numpy
+scikit-learn
+tqdm
+pyyaml
+swanlab
+matplotlib

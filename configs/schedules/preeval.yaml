@@ -1,0 +1,55 @@
+# configs/schedules/preeval.yaml
+stage: preeval
+
+train:
+  epochs: 2
+  warmup_ratio: 0.06
+  eval:
+    strategy: dense_early
+
+hpo:
+  mode: hierarchical
+
+  # keep a reasonably dense "full lr grid" for neighborhood indexing
+  lr_grid:
+    min_exp: -6
+    max_exp: -3
+    points: 15
+
+  # warmup is fixed (NOT searched)
+  warmup_grid: [0.06]
+
+  # baseline only searches LR (we'll sample 5 from lr_grid)
+  baseline_lr_points: 5
+
+  # Ours staged search (Successive Halving style)
+  ours:
+    lr_neighbor_points_small: 7     # cola/rte/mrpc
+    lr_neighbor_points_large: 5     # sst2 etc
+    stages:
+      s1:
+        epochs: 1
+        seeds: 1
+        trials: 100
+        param_pool: ["lambda_n", "lambda_o", "eta", "k", "gamma_hi"]
+        candidates_per_param: 4
+        keep_top: 2
+      s2:
+        epochs: 2
+        seeds: 1
+        trials: 40
+        combine_topk_params: 3
+      s3:
+        epochs: 4
+        seeds_small: 2
+        seeds_large: 1
+        trials_small: 120
+        trials_large: 90
+        score:
+          w_max: 0.5
+          w_final: 0.4
+          w_avg: 0.1
+
+seeds:
+  preeval: [12, 24]
+  final: [2, 3, 5, 7, 11]
