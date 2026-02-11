@@ -1,156 +1,42 @@
-stage: debug
+# configs/base.yaml
+
+model:
+  name: roberta-base
 
 task:
   name: glue/rte
   max_len: 128
 
-model:
-  name: roberta-base
-  type: sequence_classification
-
-method:
-  name: baseline
-  lora:
-    r: 8
-    R: 32
-    alpha: 16
-    dropout: 0.1
-
-  ours:
-    # legacy field (kept for backward compat; only used when history.enabled=false)
-    ema_H: 4
-
-    votes: 8  # legacy; actual voting controlled by voting.samples_per_vote
-
-    # -------------------------
-    # FIRST LAYER TRIGGER (主方向门槛)
-    # mode:
-    #   - percentile: 触发 top% 的 “worst blocks” (by metric badness)
-    #   - cos_threshold: 硬阈值触发
-    # metric:
-    #   - C_r | C_R | A_b | misalign
-    #   * C_r/C_R/A_b: 越小越糟（<= tau 触发）
-    #   * misalign=1-A_b: 越大越糟（>= tau 触发）
-    # -------------------------
-    trigger:
-      mode: percentile            # percentile | cos_threshold
-      metric: C_R                 # C_r | C_R | A_b | misalign
-      percentile_p: 90            # only when mode=percentile
-      cos_threshold: 0.30         # only when mode=cos_threshold
-
-    # backward compat
-    percentile_p: 90
-
-    # gates / correction hypers
-    k: 8.0
-    gamma_r: 0.3
-    gamma_hi: 0.3
-    eta: 0.2
-    beta_max: 0.5
-    rho_max: 0.5
-    alpha_min: 0.1
-    lambda_n: 0.4
-    lambda_o: 0.4
-
-    # -------------------------
-    # CORRECTION MODE（只保留两种）
-    # direction_only: 只做 beta_r/beta_hi + joint CAGrad（不做 alpha；不 rescale）
-    # both: alpha + (beta + CAGrad)（不 rescale）
-    # -------------------------
-    correction:
-      mode: both                  # both | direction_only
-      direction_rescale: false    # kept for compat; ignored by controller
-
-    # ---- voting control ----
-    voting:
-      samples_per_vote: 8        # {16, 8, 4} -> default 8 samples per vote window (batch=32 => 4 windows)
-      allow_tail: true
-      combine_votes: false
-      combine_size: 2
-      combine_max: 0
-      keep_single_votes: true
-
-    # ---- history / truncated EMA over steps ----
-    history:
-      enabled: true
-      window_steps: 4            # {8,4,2}
-      weighting: exp             # exp | uniform | linear
-      exp_beta: 0.7
-
 train:
-  epochs: 3
+  epochs: 1
   batch_size: 32
   lr: 2e-5
   warmup_ratio: 0.1
-  weight_decay: 0.01
-  grad_accum: 1
+  seed: 12
+
+  weight_decay: 0.0
   max_grad_norm: 1.0
-  seed: 42
+
   eval:
-    strategy: dense_early
-    dense_early_epochs: 2
-    dense_early_per_epoch: 8
-
-compute:
-  accelerator: cuda
-  num_gpus: 1
-  gpus_per_trial: 1
-  mixed_precision: "fp32"
-  compile: false
-
-hpo:
-  mode: hierarchical
-
-  lr_grid:
-    min_exp: -6
-    max_exp: -3
-    points: 15
-
-  warmup_grid: [0.06]
-  baseline_lr_points: 5
-
-  ours:
-    lr_neighbor_points_small: 7
-    lr_neighbor_points_large: 5
-    stages:
-      s1:
-        epochs: 1
-        seeds: 1
-        trials: 100
-        param_pool: ["lambda_n", "lambda_o", "eta", "k", "gamma_hi"]
-        candidates_per_param: 4
-        keep_top: 2
-      s2:
-        epochs: 2
-        seeds: 1
-        trials: 40
-        combine_topk_params: 3
-      s3:
-        epochs: 4
-        seeds_small: 2
-        seeds_large: 1
-        trials_small: 120
-        trials_large: 90
-        score:
-          w_max: 0.5
-          w_final: 0.4
-          w_avg: 0.1
+    strategy: per_epoch
+    every_steps: 50
+    first_step: false
+    max_batches: 0
 
 io:
   root: runs
   overwrite: ask
-  save_best_hparams_json: true
+  # run_dir: null   # 不要在 base 里兜底写死，靠 CLI/HPO/final 传
 
 log:
   csv: true
   swanlab:
     enabled: false
-    project: "ShakeAlign_LoRA"
-    run_group: null
+    project: ShakeAlign_LoRA
 
 debug:
-  enabled: true
-  print_every_steps: 20
+  enabled: false
+  print_every_steps: 80
   max_blocks_to_print: 3
   dump_init: true
   dump_votes: true
@@ -158,3 +44,162 @@ debug:
   dump_grad_norms: true
   dump_history: false
   assert_hi_zero_init: true
+
+# =========================
+# Method: STRICT 3-way only
+# =========================
+method:
+  # ✅ 运行时只能是三种（更严格：直接选到子树）
+  #    - ours
+  #    - baseline_r
+  #    - baseline_R
+  name: ours
+
+  # -------------------------
+  # baseline (small rank)
+  # -------------------------
+  baseline_r:
+    lora:
+      r: 16
+      alpha: 2.0
+      dropout: 0.1
+
+  # -------------------------
+  # baseline (large rank)
+  # -------------------------
+  baseline_R:
+    lora:
+      r: 128
+      alpha: 16.0
+      dropout: 0.1
+
+  # -------------------------
+  # ours (dual-rank)
+  # -------------------------
+  ours:
+    lora:
+      r: 16
+      R: 128
+      alpha: 4.0
+      dropout: 0.1
+
+    ema_H: 1
+    votes: 8
+
+    ablate:
+      interp: false
+
+    gate0_noise:
+      tau: -10.0
+      kappa: 10.0
+
+    trigger_gate0:
+      tau_N: 0.60
+      tau_D: 0.0038053
+
+    routing_delta: 0.02
+
+    pulling:
+      gamma_pull: 0.35
+      k_pull: 8.0
+
+    voting:
+      samples_per_vote: 8
+      allow_tail: true
+      keep_single_votes: true
+
+    history:
+      enabled: false
+      window_steps: 1
+      weighting: exp
+      exp_beta: 0.7
+
+    compensation:
+      enabled: true
+      ridge_lambda: 1e-4
+
+    compression:
+      enabled: false
+      every_steps: 0
+      target_rank: null
+      qr:
+        enabled: true
+      svd:
+        enabled: true
+
+# =========================
+# HPO: STRICT (no duplicated truth)
+# =========================
+hpo:
+  lr_grid:
+    min_lr: 1e-5
+    max_lr: 7e-3
+    baseline_points: 15
+    neighbor_points: 9
+    extend_factor: 1.6
+    clamp_min_lr: 1e-6
+    clamp_max_lr: 1e-2
+
+  # ✅ 不再在这里写 alpha/r/R —— baseline 的真相源只来自 method.baseline_r / method.baseline_R
+  #    这里最多允许写 tag 列表（用于控制“跑哪两个 baseline”），避免重复配置导致不一致
+  baseline_variants:
+    - { tag: baseline_r }
+    - { tag: baseline_R }
+
+  budget:
+    total_trials: 10
+
+  ratio_sensitivity: 0.20
+  ratio_grid: 0.50
+  ratio_bayes: 0.30
+
+  use_bayes: false
+
+  bandit:
+    fixed_warmup_ratio: 0.1
+    refine_seeds: [12, 24]
+    score:
+      w_max: 0.5
+      w_final: 0.4
+      w_avg: 0.1
+
+  grid:
+    knobs: ["routing_delta"]
+    drop_if_weight_lt: 0.0
+
+    baseline_sweep_epochs: 1
+    baseline_refine_epochs: 3
+    sensitivity_epochs: 1
+    grid_epochs: 3
+    sens_samples_per_knob: 40
+    sens_seed: 12
+    rng_seed: 2026
+    max_retries: 3
+
+    max_m_float: 7
+    max_m_choice: 0
+
+    bayes_rng_seed: 20260211
+    bayes_pool: 256
+    bayes_gp_length: 0.6
+    bayes_gp_var: 1.0
+    bayes_gp_noise: 1e-3
+    bayes_ei_xi: 0.01
+
+    alpha_probe:
+      enabled: true
+      num_alpha: 2
+      num_lr: 2
+      seeds: [12, 24]
+      epochs: 3
+
+    knob_specs:
+      routing_delta:
+        kind: float
+        lo: 0.005
+        hi: 0.08
+        step: 0.001
+        top_quantile: 0.2
+        padding_ratio: 0.15
+        clamp_lo: 0.0
+        clamp_hi: 1.0

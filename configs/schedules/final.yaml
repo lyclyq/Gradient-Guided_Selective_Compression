@@ -3,20 +3,22 @@ stage: final
 
 train:
   epochs: 10
-  warmup_ratio: 0.06
+  warmup_ratio: 0.1
+
   eval:
-    strategy: per_epoch
+    strategy: dense_early
+    dense_early_per_epoch: 8
+    dense_early_epochs: 2
 
-hpo:
-  mode: hierarchical
+    max_batches: 0
+    compute_train_acc: true
+    train_max_batches: 0
 
-  lr_grid:
-    min_exp: -6
-    max_exp: -3
-    points: 15
+    log_r_only: true
 
-  warmup_grid: [0.06]
+    every_steps: 50
+    first_step: false
 
-seeds:
-  preeval: [12, 24, 36]
-  final: [2, 3, 5, 7, 11]
+final:
+  epochs: 10
+  seeds: [2, 3, 5, 7, 11]

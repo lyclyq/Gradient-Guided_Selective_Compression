@@ -1,7 +1,10 @@
+# /home/lyclyq/Optimization/grad-shake-align/src/trainer.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
-from itertools import combinations
+from typing import Any, Dict, List, Tuple, Deque, Optional
+from collections import deque
+import copy
+from contextlib import contextmanager, nullcontext
 
 import torch
 from torch.utils.data import DataLoader
@@ -13,6 +16,35 @@ from .shake_align import ShakeAlignController, BlockStats
 from .lora_layers import debug_check_dualrank_init
 
 
+def _cfg_get(d: Dict[str, Any], path: str, default: Any = None) -> Any:
+    cur: Any = d
+    for k in path.split("."):
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
+
+
+def _as_int(x: Any, default: int) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _as_bool(x: Any, default: bool = False) -> bool:
+    if isinstance(x, bool):
+        return x
+    if x is None:
+        return default
+    s = str(x).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _named_dualrank_lora_modules(model) -> Dict[str, torch.nn.Module]:
     out: Dict[str, torch.nn.Module] = {}
     for name, m in model.named_modules():
@@ -22,31 +54,88 @@ def _named_dualrank_lora_modules(model) -> Dict[str, torch.nn.Module]:
 
 
 def _flatten_branch_grads(mod: torch.nn.Module) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Return scale-invariant gradient vectors (votes):
+      g_r = concat(vec(dA_r), vec(dB_r)) / scaling_r
+      g_hi = concat(vec(dA_hi), vec(dB_hi)) / scaling_hi
+
+    IMPORTANT:
+      - This is the ONLY place outside ShakeAlign that touches scaling,
+        and it only DIVIDES to remove scaling for decision-making.
+      - Writing scaled grads back happens ONLY inside ShakeAlign.
+    """
     device = next(mod.parameters()).device
 
-    def g_or_zeros(p: torch.nn.Parameter) -> torch.Tensor:
+    if not hasattr(mod, "scaling_r") or not hasattr(mod, "scaling_hi"):
+        raise RuntimeError(
+            f"[ScalingMissing] {type(mod).__name__} missing scaling_r/scaling_hi. Module={mod}"
+        )
+
+    sr = float(getattr(mod, "scaling_r"))
+    shi = float(getattr(mod, "scaling_hi"))
+    if abs(sr) < 1e-12 or abs(shi) < 1e-12:
+        raise RuntimeError(f"[ScalingInvalid] sr={sr} shi={shi} (must be nonzero)")
+
+    def g_or_zeros(p: torch.nn.Parameter, s: float) -> torch.Tensor:
         if p.grad is None:
             return torch.zeros_like(p, device=device).flatten()
-        return p.grad.detach().flatten()
+        g = p.grad.detach()
+        g = g / s
+        return g.flatten()
 
-    g_r = torch.cat([g_or_zeros(mod.lora_A_r), g_or_zeros(mod.lora_B_r)], dim=0)
-    g_hi = torch.cat([g_or_zeros(mod.lora_A_hi), g_or_zeros(mod.lora_B_hi)], dim=0)
+    g_r = torch.cat(
+        [g_or_zeros(mod.lora_A_r, sr), g_or_zeros(mod.lora_B_r, sr)],
+        dim=0,
+    )
+    g_hi = torch.cat(
+        [g_or_zeros(mod.lora_A_hi, shi), g_or_zeros(mod.lora_B_hi, shi)],
+        dim=0,
+    )
     return g_r, g_hi
 
 
+@contextmanager
+def _set_dualrank_use_hi(model, use_hi: bool):
+    touched = []
+    for m in model.modules():
+        if hasattr(m, "use_hi") and hasattr(m, "lora_A_hi") and hasattr(m, "lora_B_hi"):
+            touched.append((m, bool(getattr(m, "use_hi"))))
+            setattr(m, "use_hi", bool(use_hi))
+    try:
+        yield
+    finally:
+        for m, old in touched:
+            setattr(m, "use_hi", old)
+
+
 @torch.no_grad()
-def evaluate(model, loader: DataLoader, device: torch.device) -> float:
+def evaluate_acc(
+    model,
+    loader: DataLoader,
+    device: torch.device,
+    max_batches: int = 0,
+    *,
+    use_hi: Optional[bool] = None,
+) -> float:
+    was_training = bool(model.training)
     model.eval()
     correct = 0
     total = 0
-    for batch in loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-        out = model(**batch)
-        preds = out.logits.argmax(dim=-1)
-        labels = batch["labels"]
-        correct += (preds == labels).sum().item()
-        total += labels.numel()
-    model.train()
+
+    ctx = nullcontext() if use_hi is None else _set_dualrank_use_hi(model, use_hi)
+
+    with ctx:
+        for i, batch in enumerate(loader):
+            if max_batches > 0 and i >= max_batches:
+                break
+            batch = {k: v.to(device) for k, v in batch.items()}
+            out = model(**batch)
+            preds = out.logits.argmax(dim=-1)
+            labels = batch["labels"]
+            correct += (preds == labels).sum().item()
+            total += labels.numel()
+
+    model.train(was_training)
     return correct / max(total, 1)
 
 
@@ -70,11 +159,17 @@ def _vote_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     voting = ours.get("voting", {}) or {}
     return {
         "samples_per_vote": int(voting.get("samples_per_vote", 8)),
-        "combine_enabled": bool(voting.get("combine_votes", False)),
-        "combine_size": int(voting.get("combine_size", 2)),
-        "combine_max": int(voting.get("combine_max", 0)),
         "keep_single_votes": bool(voting.get("keep_single_votes", True)),
         "allow_tail": bool(voting.get("allow_tail", True)),
+    }
+
+
+def _vote_history_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    ours = cfg.get("method", {}).get("ours", {}) or {}
+    hist = ours.get("history", {}) or {}
+    return {
+        "enabled": bool(hist.get("enabled", False)),
+        "steps": int(hist.get("window_steps", 4)),
     }
 
 
@@ -90,6 +185,14 @@ def _split_indices(n: int, chunk: int, allow_tail: bool) -> List[Tuple[int, int]
     return out
 
 
+def _avg_last_k(seq: List[float], k: int) -> float:
+    if not seq:
+        return float("-inf")
+    k = max(1, int(k))
+    take = seq[-k:] if len(seq) >= k else seq
+    return float(sum(take) / len(take))
+
+
 def train_one(
     cfg: dict,
     model,
@@ -103,25 +206,97 @@ def train_one(
     epochs = int(cfg["train"]["epochs"])
     lr = float(cfg["train"]["lr"])
     warmup_ratio = float(cfg["train"]["warmup_ratio"])
-    weight_decay = float(cfg["train"]["weight_decay"])
+    weight_decay = float(cfg["train"].get("weight_decay", 0.0))
     max_grad_norm = float(cfg["train"].get("max_grad_norm", 1.0))
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     total_steps = epochs * len(train_loader)
     warmup_steps = int(total_steps * warmup_ratio)
-    sched = get_linear_schedule_with_warmup(opt, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
+    sched = get_linear_schedule_with_warmup(
+        opt, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    )
 
     lora_modules = _named_dualrank_lora_modules(model)
 
     dbg = _dbg_cfg(cfg)
     vote_cfg = _vote_cfg(cfg)
+    vh_cfg = _vote_history_cfg(cfg)
 
-    controller = ShakeAlignController(cfg) if cfg["method"]["name"] == "ours" else None
+    is_ours = (cfg.get("method", {}).get("name", "") == "ours")
+
+    # -------- eval config --------
+    stage = str(cfg.get("stage", "") or "").strip().lower()
+
+    eval_strategy = str(_cfg_get(cfg, "train.eval.strategy", "per_epoch")).strip().lower()
+    if eval_strategy == "epoch":
+        eval_strategy = "per_epoch"
+
+    if stage != "final" and eval_strategy == "dense_early":
+        eval_strategy = "per_epoch"
+
+    dense_eval_per_epoch = _as_int(_cfg_get(cfg, "train.eval.dense_early_per_epoch", 8), 8)
+    dense_early_epochs = _as_int(_cfg_get(cfg, "train.eval.dense_early_epochs", 2), 2)
+
+    eval_every_steps = _as_int(_cfg_get(cfg, "train.eval.every_steps", 50), 50)
+    eval_first_step = _as_bool(_cfg_get(cfg, "train.eval.first_step", False), False)
+    eval_max_batches = _as_int(_cfg_get(cfg, "train.eval.max_batches", 0), 0)
+
+    compute_train_acc = _as_bool(_cfg_get(cfg, "train.eval.compute_train_acc", True), True)
+    train_acc_max_batches = _as_int(_cfg_get(cfg, "train.eval.train_max_batches", 0), 0)
+
+    eval_r_only = _as_bool(_cfg_get(cfg, "train.eval.log_r_only", True), True)
+
+    if eval_strategy not in {"dense_early", "per_epoch", "steps", "none"}:
+        print(f"[WARN] Unknown train.eval.strategy={eval_strategy!r}, fallback to per_epoch")
+        eval_strategy = "per_epoch"
+
+    def _should_eval(
+        *,
+        global_step: int,
+        step_in_epoch: int,
+        steps_in_epoch: int,
+        is_epoch_end: bool,
+        ep: int,
+    ) -> bool:
+        if eval_strategy == "none":
+            return False
+
+        if is_epoch_end:
+            return True
+
+        if eval_strategy == "per_epoch":
+            if eval_first_step and ep == 1 and step_in_epoch == 1:
+                return True
+            return False
+
+        if eval_strategy == "dense_early":
+            if ep > dense_early_epochs:
+                return False
+            k = max(1, int(dense_eval_per_epoch))
+            every = max(1, steps_in_epoch // k)
+            if step_in_epoch >= steps_in_epoch:
+                return False
+            return (step_in_epoch % every) == 0
+
+        if eval_first_step and global_step == 1:
+            return True
+        if eval_every_steps <= 0:
+            return False
+        return (global_step % eval_every_steps) == 0
+
+    # -------- controller config: disable double smoothing --------
+    cfg_ctrl = copy.deepcopy(cfg)
+    cfg_ctrl.setdefault("method", {})
+    cfg_ctrl["method"].setdefault("ours", {})
+    cfg_ctrl["method"]["ours"]["ema_H"] = 1
+    cfg_ctrl["method"]["ours"].setdefault("history", {})
+    cfg_ctrl["method"]["ours"]["history"]["enabled"] = False
+
+    controller = ShakeAlignController(cfg_ctrl) if is_ours else None
     if controller is not None:
         controller.set_lora_modules(lora_modules)
 
-    # ---- Debug init check (once) ----
     if controller is not None and dbg["enabled"] and dbg["dump_init"]:
         debug_check_dualrank_init(
             model,
@@ -131,31 +306,71 @@ def train_one(
 
     best_val = -1.0
     best_epoch = -1
-    val_history: List[float] = []
+
+    val_history_epoch: List[float] = []
+    val_r_only_history_epoch: List[float] = []
+    train_history_epoch: List[float] = []
+    train_r_only_history_epoch: List[float] = []
 
     global_step = 0
-    eval_strategy = cfg["train"]["eval"]["strategy"]
-    dense_eval_per_epoch = int(cfg["train"]["eval"].get("dense_early_per_epoch", 8))
-    dense_early_epochs = int(cfg["train"]["eval"].get("dense_early_epochs", 2))
+    last_eval_global_step = -1
+
+    # -------- vote history buffers --------
+    vote_hist_enabled = bool(vh_cfg["enabled"])
+    vote_hist_steps = max(1, int(vh_cfg["steps"]))
+    vote_hist_r: Dict[str, Deque[torch.Tensor]] = {n: deque(maxlen=vote_hist_steps) for n in lora_modules.keys()}
+    vote_hist_hi: Dict[str, Deque[torch.Tensor]] = {n: deque(maxlen=vote_hist_steps) for n in lora_modules.keys()}
+
+    def _do_eval_and_log(step: int, ep: int) -> None:
+        nonlocal best_val, best_epoch, last_eval_global_step
+        if step == last_eval_global_step:
+            return
+
+        val_acc = evaluate_acc(model, val_loader, device, max_batches=eval_max_batches, use_hi=True)
+        payload: Dict[str, Any] = {"val/acc": float(val_acc), "epoch": int(ep)}
+
+        val_acc_r = None
+        if is_ours and eval_r_only:
+            val_acc_r = evaluate_acc(model, val_loader, device, max_batches=eval_max_batches, use_hi=False)
+            payload["val/acc_r_only"] = float(val_acc_r)
+
+        if compute_train_acc:
+            tr_acc = evaluate_acc(model, train_loader, device, max_batches=train_acc_max_batches, use_hi=True)
+            payload["train/acc"] = float(tr_acc)
+            payload["gap/train_minus_val"] = float(tr_acc - val_acc)
+
+            if is_ours and eval_r_only:
+                tr_acc_r = evaluate_acc(model, train_loader, device, max_batches=train_acc_max_batches, use_hi=False)
+                payload["train/acc_r_only"] = float(tr_acc_r)
+                if val_acc_r is not None:
+                    payload["gap_r_only/train_minus_val_r_only"] = float(tr_acc_r - float(val_acc_r))
+
+        logger.log(step, payload)
+        last_eval_global_step = step
+
+        if val_acc > best_val:
+            best_val = float(val_acc)
+            best_epoch = int(ep)
 
     for ep in range(1, epochs + 1):
         model.train()
         pbar = tqdm(train_loader, desc=f"epoch {ep}/{epochs}")
 
-        for batch in pbar:
+        steps_in_epoch = len(train_loader)
+
+        for step_in_epoch, batch in enumerate(pbar, start=1):
             global_step += 1
             batch = {k: v.to(device) for k, v in batch.items()}
+            step_loss_val = 0.0
 
             if controller is None:
                 out = model(**batch)
                 loss = out.loss
                 loss.backward()
-                logger.log(global_step, {"train/loss": float(loss.item())})
+                step_loss_val = float(loss.item())
+                logger.log(global_step, {"train/loss": step_loss_val})
 
             else:
-                # -------------------------
-                # Voting windows
-                # -------------------------
                 bs = int(batch["input_ids"].shape[0])
                 spv = int(vote_cfg["samples_per_vote"])
                 allow_tail = bool(vote_cfg["allow_tail"])
@@ -164,107 +379,101 @@ def train_one(
                 if len(windows) == 0:
                     windows = [(0, bs)]
 
-                # per-window vote vectors (single-window votes)
-                win_votes_r: Dict[str, List[torch.Tensor]] = {n: [] for n in lora_modules.keys()}
-                win_votes_hi: Dict[str, List[torch.Tensor]] = {n: [] for n in lora_modules.keys()}
+                step_votes_r: Dict[str, List[torch.Tensor]] = {n: [] for n in lora_modules.keys()}
+                step_votes_hi: Dict[str, List[torch.Tensor]] = {n: [] for n in lora_modules.keys()}
 
-                # accumulate total grads over windows (sum => full batch grad)
                 total_grads: Dict[torch.nn.Parameter, torch.Tensor] = {}
-                loss = None
+                loss_mean_batch = 0.0
 
                 for (s, e) in windows:
                     sub = {k: v[s:e] for k, v in batch.items()}
+                    win_weight = float(e - s) / float(bs)
+                    if win_weight <= 0.0:
+                        raise RuntimeError(f"[trainer] invalid window weight: s={s} e={e} bs={bs}")
 
                     opt.zero_grad(set_to_none=True)
                     out = model(**sub)
-                    loss = out.loss
-                    loss.backward()
+                    win_loss = out.loss
+                    loss_mean_batch += float(win_loss.detach().item()) * win_weight
+                    win_loss.backward()
 
-                    # snapshot per-block vote grads for this window
+                    # scale-invariant votes (divide scaling here)
                     for name, mod in lora_modules.items():
                         g_r, g_hi = _flatten_branch_grads(mod)
-                        win_votes_r[name].append(g_r)
-                        win_votes_hi[name].append(g_hi)
+                        step_votes_r[name].append(g_r)
+                        step_votes_hi[name].append(g_hi)
 
-                    # accumulate into total grads
+                    # accumulate REAL grads (still scaled) for optimizer step later,
+                    # but will be overwritten by ShakeAlign write-back anyway.
                     with torch.no_grad():
                         for p in model.parameters():
                             if p.grad is None:
                                 continue
                             if p not in total_grads:
-                                total_grads[p] = p.grad.detach().clone()
+                                total_grads[p] = p.grad.detach().clone() * win_weight
                             else:
-                                total_grads[p].add_(p.grad.detach())
+                                total_grads[p].add_(p.grad.detach(), alpha=win_weight)
 
-                # restore accumulated grad (full batch)
                 opt.zero_grad(set_to_none=True)
                 with torch.no_grad():
                     for p, g in total_grads.items():
                         p.grad = g
+                step_loss_val = float(loss_mean_batch)
 
-                # -------------------------
-                # Build vote matrices (single + combined)
-                # -------------------------
-                votes_r: Dict[str, List[torch.Tensor]] = {n: [] for n in lora_modules.keys()}
-                votes_hi: Dict[str, List[torch.Tensor]] = {n: [] for n in lora_modules.keys()}
+                packed_step_r: Dict[str, torch.Tensor] = {}
+                packed_step_hi: Dict[str, torch.Tensor] = {}
+                for name in lora_modules.keys():
+                    if not step_votes_r[name]:
+                        continue
+                    packed_step_r[name] = torch.stack(step_votes_r[name], dim=0)
+                    packed_step_hi[name] = torch.stack(step_votes_hi[name], dim=0)
 
-                # keep single votes?
-                if vote_cfg["keep_single_votes"]:
+                if vote_hist_enabled:
                     for name in lora_modules.keys():
-                        votes_r[name].extend(win_votes_r[name])
-                        votes_hi[name].extend(win_votes_hi[name])
+                        if name in packed_step_r:
+                            vote_hist_r[name].append(packed_step_r[name].detach())
+                            vote_hist_hi[name].append(packed_step_hi[name].detach())
 
-                # add combined votes?
-                if vote_cfg["combine_enabled"]:
-                    comb_k = int(vote_cfg["combine_size"])
-                    max_comb = int(vote_cfg["combine_max"])
-                    idxs = list(range(len(windows)))
-                    combs = list(combinations(idxs, comb_k)) if len(idxs) >= comb_k else []
-                    if max_comb > 0:
-                        combs = combs[:max_comb]
+                votes_r: Dict[str, torch.Tensor] = {}
+                votes_hi: Dict[str, torch.Tensor] = {}
+                for name in lora_modules.keys():
+                    if vote_hist_enabled:
+                        if len(vote_hist_r[name]) == 0:
+                            continue
+                        votes_r[name] = torch.cat(list(vote_hist_r[name]), dim=0)
+                        votes_hi[name] = torch.cat(list(vote_hist_hi[name]), dim=0)
+                    else:
+                        if name not in packed_step_r:
+                            continue
+                        votes_r[name] = packed_step_r[name]
+                        votes_hi[name] = packed_step_hi[name]
 
-                    for name in lora_modules.keys():
-                        for c in combs:
-                            vr = torch.stack([win_votes_r[name][i] for i in c], dim=0).sum(dim=0)
-                            vhi = torch.stack([win_votes_hi[name][i] for i in c], dim=0).sum(dim=0)
-                            votes_r[name].append(vr)
-                            votes_hi[name].append(vhi)
-
-                # -------------------------
-                # stats per block (+ window EMA in controller)
-                # -------------------------
                 stats: Dict[str, BlockStats] = {}
                 vote_sums: Dict[str, Dict[str, torch.Tensor]] = {}
+                single_vote_blocks = 0
 
                 for name in lora_modules.keys():
-                    if len(votes_r[name]) == 0:
+                    if name not in votes_r:
                         continue
-                    vr = torch.stack(votes_r[name], dim=0)
-                    vhi = torch.stack(votes_hi[name], dim=0)
+                    vr = votes_r[name]
+                    vhi = votes_hi[name]
+                    if vr.shape[0] < 2:
+                        single_vote_blocks += 1
+                        continue
+
                     fresh = controller.compute_stats_from_votes(vr, vhi)
                     smooth = controller.ema_update(name, fresh)
                     stats[name] = smooth
-                    vote_sums[name] = {"sum_r": vr.sum(dim=0)}
+                    vote_sums[name] = {"votes_r": vr, "votes_hi": vhi}
 
-                # ---- periodic vote/stat debug ----
                 if dbg["enabled"] and dbg["dump_votes"] and (global_step % dbg["print_every_steps"] == 0):
-                    items = []
-                    for n, s in stats.items():
-                        mis = float(1.0 - s.A_b)
-                        srn = float(vote_sums[n]["sum_r"].norm().item()) if n in vote_sums else 0.0
-                        items.append((mis, n, s, srn))
-                    items.sort(reverse=True, key=lambda x: x[0])
+                    any_name = next(iter(votes_r.keys()), None)
+                    v_total = int(votes_r[any_name].shape[0]) if any_name else 0
+                    print(f"[DBG][Step={global_step}] vote_hist={vote_hist_enabled} H={vote_hist_steps} V_total≈{v_total}")
+                    if single_vote_blocks > 0:
+                        print(f"[DBG][Step={global_step}] single-vote blocks skipped={single_vote_blocks}")
 
-                    print(
-                        f"[DBG][Step={global_step}][VoteCfg] bs={bs} spv={spv} windows={len(windows)} "
-                        f"single_votes={len(win_votes_r[next(iter(lora_modules.keys()))]) if lora_modules else 0} "
-                        f"combine={vote_cfg['combine_enabled']} size={vote_cfg['combine_size']}"
-                    )
-                    print(f"[DBG][Step={global_step}][Vote] top{dbg['max_blocks_to_print']} by misalign")
-                    for mis, n, s, srn in items[: dbg["max_blocks_to_print"]]:
-                        print(f"  [{n}] A={s.A_b:.4f} mis={mis:.4f} Cr={s.C_r:.4f} CR={s.C_R:.4f} ||sum_r||={srn:.4f}")
-
-                # apply correction (+ gate trace + optional history trace)
+                # IMPORTANT: write-back scaling happens ONLY inside ShakeAlign
                 info = controller.apply_in_place_corrections(
                     lora_modules=lora_modules,
                     stats=stats,
@@ -274,97 +483,88 @@ def train_one(
                     debug_history=bool(dbg["enabled"] and dbg["dump_history"]),
                 )
 
-                # ---- gate debug printing (only triggered blocks) ----
-                if dbg["enabled"] and dbg["dump_gates"] and (global_step % dbg["print_every_steps"] == 0):
-                    thr = float(info.get("alignment_threshold", 0.0))
-                    trig = int(float(info.get("triggered_blocks", 0.0)))
-                    print(f"[DBG][Step={global_step}][Gate] tau={thr:.4f} triggered={trig}/{len(lora_modules)}")
-
-                    per = info.get("per_block", {}) or {}
-                    shown = 0
-                    for n, t in per.items():
-                        if shown >= dbg["max_blocks_to_print"]:
-                            break
-                        shown += 1
-                        print(
-                            f"  [{n}] A={t['A_b']:.4f} mis={t['misalign']:.4f} "
-                            f"Cr={t['C_r']:.4f} CR={t['C_R']:.4f} dC={t['delta_C']:.4f} "
-                            f"wN={t['w_noise']:.4f} wO={t['w_over']:.4f} wI={t['w_insuf']:.4f}"
-                        )
-                        print(
-                            f"    alpha_r: {t['alpha_r_raw']:.4f}->{t['alpha_r']:.4f}  "
-                            f"alpha_hi: {t['alpha_hi_raw']:.4f}->{t['alpha_hi']:.4f}"
-                        )
-                        print(
-                            f"    beta_r: {t['beta_r_raw']:.4f}->{t['beta_r']:.4f}  "
-                            f"beta_hi: {t['beta_hi_raw']:.4f}->{t['beta_hi']:.4f}  "
-                            f"rho: {t['rho_raw']:.4f}->{t['rho']:.4f}"
-                        )
-                        if dbg["dump_grad_norms"]:
-                            gn = (info.get("per_block_grad_norm", {}) or {}).get(n, None)
-                            if gn is not None:
-                                print(
-                                    f"    ||g_r|| {gn.get('g_r_before', 0.0):.4f}->{gn.get('g_r_after', 0.0):.4f}  "
-                                    f"||g_hi|| {gn.get('g_hi_before', 0.0):.4f}->{gn.get('g_hi_after', 0.0):.4f}"
-                                )
-                        if dbg["dump_history"]:
-                            hd = (info.get("per_block_history", {}) or {}).get(n, None)
-                            if hd is not None and hd.get("enabled", False):
-                                print(f"    [HIST] mode={hd.get('mode')} n={hd.get('n')} window={hd.get('window_steps')}")
-                                print(f"    [HIST] weights={hd.get('weights')}")
-
-                loss_val = float(loss.item()) if loss is not None else 0.0
                 logger.log(
                     global_step,
                     {
-                        "train/loss": loss_val,
-                        "train/triggered_blocks": info.get("triggered_blocks", 0.0),
-                        "train/align_thr": info.get("alignment_threshold", 0.0),
+                        "train/loss": float(step_loss_val),
+                        "train/gate0_triggered_blocks": info.get("triggered_blocks", 0.0),
+                        "train/single_vote_skipped_blocks": float(single_vote_blocks),
+                        "train/tau_N": info.get("tau_N", 0.0),
+                        "train/tau_D": info.get("tau_D", 0.0),
                     },
                 )
 
-            # step
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             opt.step()
             sched.step()
             opt.zero_grad(set_to_none=True)
 
-            pbar.set_postfix({"loss": f"{float(loss.item()) if loss is not None else 0.0:.4f}"})
+            pbar.set_postfix({"loss": f"{float(step_loss_val):.4f}"})
 
-            # dense early eval
-            if eval_strategy == "dense_early" and ep <= dense_early_epochs:
-                every = max(1, len(train_loader) // dense_eval_per_epoch)
-                if (global_step % every) == 0:
-                    val_acc = evaluate(model, val_loader, device)
-                    val_history.append(val_acc)
-                    logger.log(global_step, {"val/acc": val_acc})
-                    if val_acc > best_val:
-                        best_val = val_acc
-                        best_epoch = ep
+            if _should_eval(
+                global_step=global_step,
+                step_in_epoch=step_in_epoch,
+                steps_in_epoch=steps_in_epoch,
+                is_epoch_end=False,
+                ep=ep,
+            ):
+                _do_eval_and_log(global_step, ep)
 
-        # per-epoch eval
-        if eval_strategy == "per_epoch":
-            val_acc = evaluate(model, val_loader, device)
-            val_history.append(val_acc)
-            logger.log(global_step, {"val/acc": val_acc, "epoch": ep})
-            if val_acc > best_val:
-                best_val = val_acc
-                best_epoch = ep
+        if _should_eval(
+            global_step=global_step,
+            step_in_epoch=steps_in_epoch,
+            steps_in_epoch=steps_in_epoch,
+            is_epoch_end=True,
+            ep=ep,
+        ):
+            _do_eval_and_log(global_step, ep)
 
-    # summarize val stats
-    if len(val_history) == 0:
-        val_max = best_val
-        val_final = best_val
-        val_avg = best_val
+            # epoch-end summary snapshots
+            val_acc = evaluate_acc(model, val_loader, device, max_batches=eval_max_batches, use_hi=True)
+            val_history_epoch.append(float(val_acc))
+
+            if is_ours and eval_r_only:
+                val_acc_r = evaluate_acc(model, val_loader, device, max_batches=eval_max_batches, use_hi=False)
+                val_r_only_history_epoch.append(float(val_acc_r))
+
+            if compute_train_acc:
+                tr_acc = evaluate_acc(model, train_loader, device, max_batches=train_acc_max_batches, use_hi=True)
+                train_history_epoch.append(float(tr_acc))
+
+                if is_ours and eval_r_only:
+                    tr_acc_r = evaluate_acc(model, train_loader, device, max_batches=train_acc_max_batches, use_hi=False)
+                    train_r_only_history_epoch.append(float(tr_acc_r))
+
+    # -------- summary metrics --------
+    if len(val_history_epoch) == 0:
+        val_max = float(best_val)
+        val_final = float(best_val)
+        val_avg_last3 = float(best_val)
     else:
-        val_max = float(max(val_history))
-        val_final = float(val_history[-1])
-        val_avg = float(sum(val_history) / len(val_history))
+        val_max = float(max(val_history_epoch))
+        val_final = float(val_history_epoch[-1])
+        val_avg_last3 = _avg_last_k(val_history_epoch, 3)
 
-    return {
+    out: Dict[str, float] = {
         "best_val_acc": float(best_val),
         "best_epoch": float(best_epoch),
-        "val_max": val_max,
-        "val_final": val_final,
-        "val_avg": val_avg,
+        "val_max": float(val_max),
+        "val_final": float(val_final),
+        "val_avg": float(val_avg_last3),
+        "val_avg_last3ep": float(val_avg_last3),
     }
+
+    if is_ours and eval_r_only and len(val_r_only_history_epoch) > 0:
+        out["val_r_only_max"] = float(max(val_r_only_history_epoch))
+        out["val_r_only_final"] = float(val_r_only_history_epoch[-1])
+        out["val_r_only_avg_last3ep"] = float(_avg_last_k(val_r_only_history_epoch, 3))
+
+    if len(train_history_epoch) > 0:
+        out["train_final"] = float(train_history_epoch[-1])
+        out["train_max"] = float(max(train_history_epoch))
+
+    if is_ours and eval_r_only and len(train_r_only_history_epoch) > 0:
+        out["train_r_only_final"] = float(train_r_only_history_epoch[-1])
+        out["train_r_only_max"] = float(max(train_r_only_history_epoch))
+
+    return out

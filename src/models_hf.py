@@ -1,8 +1,4 @@
-#src.models_hf.py
-
 from __future__ import annotations
-
-from typing import Any, Dict
 
 import torch
 from transformers import AutoConfig, AutoModelForSequenceClassification
